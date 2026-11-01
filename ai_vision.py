@@ -2,16 +2,18 @@
 ========================================================================================
 BOT PULICHIMICA - Modulo Vision AI con Google Gemini (ai_vision.py)
 ========================================================================================
-Gestisce l'analisi visiva e documentale di bolle di consegna (DDT), fatture
-e documenti di trasporto merci ricevuti come foto o PDF.
-Utilizza la libreria 'google.generativeai' con il modello 'gemini-1.5-flash'
-(con fallback automatico a 'gemini-3.8-flash' se 1.5-flash non è disponibile
-sull'endpoint attivo).
-Importa unicamente 'config' per evitare qualsiasi circular import.
+Gestisce l'analisi visiva di bolle di consegna (DDT), fatture e documenti di carico merci.
+Utilizza 'google.generativeai' con il modello 'gemini-1.5-flash' (e fallback automatico
+a 'gemini-3.8-flash' qualora la versione 1.5 risulti ritirata per le nuove chiavi API).
+Restituisce ESCLUSIVAMENTE una stringa JSON pura rappresentante un array di oggetti:
+[{"sku": "...", "nome_prodotto": "...", "quantita_aggiunta": <int>}, ...]
+Importa unicamente 'config' per evitare dipendenze circolari.
 ========================================================================================
 """
 
 import os
+import re
+import json
 import asyncio
 import mimetypes
 import warnings
@@ -36,25 +38,23 @@ if GEMINI_API_KEY:
 MODELLO_PRINCIPALE = "gemini-1.5-flash"
 MODELLO_FALLBACK = "gemini-3.8-flash"
 
-PROMPT_CARICO_MAGAZZINO = """Sei l'assistente AI per la gestione di magazzino di "Pulichimica".
-Analizza l'immagine o il documento allegato (Bolla di Consegna / DDT / Fattura / Documento di Trasporto).
+PROMPT_CARICO_MAGAZZINO = """Analizza con la massima accuratezza l'immagine o il documento allegato (Bolla di Consegna / DDT / Fattura / Documento di Trasporto).
+Il tuo obiettivo è estrarre tutti i prodotti ricevuti per registrare il carico merci a magazzino su Shopify.
 
-Estrai con la massima accuratezza tutti i dati utili per registrare il carico merci a magazzino, formattandoli in modo chiaro e leggibile per Telegram (usa testo formattato in stile markdown con elenchi puntati):
+Devi restituire ESCLUSIVAMENTE un array JSON puro, senza testo introduttivo o conclusivo, senza commenti e senza formattazione markdown (NON usare i delimitatori ```json o ```).
 
-🏢 **Fornitore / Mittente**: (Ragione sociale fornitore, P.IVA/CF se presente)
-📄 **Documento**: (Tipo: es. DDT o Fattura, Numero documento, Data documento)
+Ogni elemento dell'array deve essere un oggetto JSON con le seguenti chiavi:
+- "sku": codice articolo o SKU del fornitore/prodotto se leggibile nel documento (se assente o illeggibile, lascia una stringa vuota "")
+- "nome_prodotto": denominazione o descrizione completa del prodotto (obbligatorio, es. "MA-FRA 8 PLUS 25KG")
+- "quantita_aggiunta": numero intero di pezzi, colli o flaconi caricati (deve essere un valore intero, es. 20)
 
-📦 **Articoli Ricevuti**:
-Per ciascun articolo presente nel documento, crea una voce con:
-- **Descrizione**: Nome completo del prodotto / articolo
-- **Quantità**: Numero di pezzi / colli / litri / kg (specifica sempre l'unità di misura)
-- **Codice / SKU**: Codice articolo del fornitore (se indicato)
-- **Prezzo Unitario / Sconto**: (se visibile, altrimenti 'Non specificato')
+Se il documento non è leggibile, è sfocato o non contiene articoli di magazzino, restituisci semplicemente un array vuoto: []
 
-💶 **Riepilogo Economico**: (Totale imponibile / Totale documento, se indicati)
-📝 **Note e Discrepanze**: (Eventuali lotti di produzione, date di scadenza, colli mancanti o anomalie visibili nel documento)
-
-Se il documento non è leggibile, è sfocato o non sembra una bolla/fattura, segnalalo chiaramente all'inizio del messaggio."""
+Esempio esatto di output:
+[
+  {"sku": "P0210", "nome_prodotto": "MA-FRA 8 PLUS 25KG", "quantita_aggiunta": 10},
+  {"sku": "", "nome_prodotto": "MA-FRA Fast Cleaner 500ml", "quantita_aggiunta": 24}
+]"""
 
 
 def _determina_mime_type(file_path: Path) -> str:
@@ -78,16 +78,55 @@ def _determina_mime_type(file_path: Path) -> str:
     return mapping.get(ext, "application/octet-stream")
 
 
+def _pulisci_json_risposta(testo: str) -> str:
+    """
+    Rimuove eventuali blocchi markdown (```json ... ```) e testo spazzola,
+    estraendo la sottostringa JSON compresa tra la prima '[' e l'ultima ']'.
+    Verifica che il JSON sia formalmente valido prima di restituirlo.
+    """
+    if not testo:
+        return "[]"
+
+    pulito = testo.strip()
+
+    # Rimozione eventuali fence markdown
+    pulito = re.sub(r"^```(?:json)?\s*", "", pulito, flags=re.IGNORECASE)
+    pulito = re.sub(r"\s*```$", "", pulito)
+    pulito = pulito.strip()
+
+    # Isolamento dell'array JSON racchiuso tra parentesi quadre
+    start = pulito.find("[")
+    end = pulito.rfind("]")
+    if start != -1 and end != -1 and end >= start:
+        pulito = pulito[start : end + 1].strip()
+
+    # Validazione formale del JSON
+    try:
+        parsed = json.loads(pulito)
+        if isinstance(parsed, list):
+            return json.dumps(parsed, ensure_ascii=False)
+        elif isinstance(parsed, dict):
+            # Se per errore ha restituito un singolo oggetto o un wrapper {"prodotti": [...]}
+            for val in parsed.values():
+                if isinstance(val, list):
+                    return json.dumps(val, ensure_ascii=False)
+            return json.dumps([parsed], ensure_ascii=False)
+    except Exception as e:
+        logger.warning(f"[AI VISION] Parsing JSON fallito ({e}), raw output: {testo[:200]}")
+
+    return "[]"
+
+
 async def analizza_documento_carico(file_path: str | Path, cfg: dict = None, api_key: str = None) -> str:
     """
     Funzione asincrona che riceve il percorso di un file locale (immagine o PDF).
-    Carica i dati del file, invoca l'API di Gemini 1.5 Flash con il prompt per
-    estrarre i dati utili per il carico magazzino e restituisce il testo generato.
+    Carica i dati del file, invoca l'API di Gemini richiedendo un array JSON puro
+    con i prodotti da caricare a magazzino, e restituisce la stringa JSON validata.
     """
     path_obj = Path(file_path).resolve()
     if not path_obj.exists() or not path_obj.is_file():
         logger.error(f"[AI VISION] File non trovato: {path_obj}")
-        return f"⚠️ Errore: File non trovato in `{path_obj}`."
+        return "[]"
 
     # Risoluzione chiave API Gemini
     chiave = (
@@ -99,36 +138,32 @@ async def analizza_documento_carico(file_path: str | Path, cfg: dict = None, api
     ).strip()
 
     if not chiave:
-        logger.warning("[AI VISION] GEMINI_API_KEY non configurata.")
-        return (
-            "⚠️ **Chiave API Gemini mancante!**\n\n"
-            "Per utilizzare la lettura automatica di bolle e fatture con l'AI, "
-            "inserisci la variabile `GEMINI_API_KEY` nel file `.env` del bot."
-        )
+        logger.warning("[AI VISION] GEMINI_API_KEY non configurata nel .env.")
+        return "[]"
 
-    # Assicura che google.generativeai sia configurato con la chiave attiva
     genai.configure(api_key=chiave)
-
     mime_type = _determina_mime_type(path_obj)
-    logger.info(f"[AI VISION] Avvio analisi asincrona su '{path_obj.name}' (MIME: {mime_type})...")
+    logger.info(f"[AI VISION] Avvio analisi JSON su '{path_obj.name}' (MIME: {mime_type})...")
 
     try:
-        # Lettura del file in memoria (bytes)
         file_bytes = path_obj.read_bytes()
         if not file_bytes:
-            return "⚠️ Il file ricevuto è vuoto (0 byte)."
+            logger.warning(f"[AI VISION] File '{path_obj.name}' vuoto (0 byte).")
+            return "[]"
 
-        # Creazione del payload multimodale compatibile sia per immagini che per documenti PDF
         parte_documento = {
             "mime_type": mime_type,
             "data": file_bytes,
         }
         contenuti = [PROMPT_CARICO_MAGAZZINO, parte_documento]
 
+        # Configurazione per forzare l'output JSON nativo
+        generation_config = {"response_mime_type": "application/json"}
+
         # 1. Tentativo con il modello richiesto: gemini-1.5-flash
         try:
-            logger.info(f"[AI VISION] Invocazione modello '{MODELLO_PRINCIPALE}'...")
-            modello = genai.GenerativeModel(MODELLO_PRINCIPALE)
+            logger.info(f"[AI VISION] Invocazione modello '{MODELLO_PRINCIPALE}' con response_mime_type=application/json...")
+            modello = genai.GenerativeModel(MODELLO_PRINCIPALE, generation_config=generation_config)
             response = await modello.generate_content_async(contenuti)
         except (NotFound, GoogleAPIError, Exception) as mod_err:
             msg_err = str(mod_err).lower()
@@ -137,21 +172,19 @@ async def analizza_documento_carico(file_path: str | Path, cfg: dict = None, api
                     f"[AI VISION] '{MODELLO_PRINCIPALE}' non attivo o ritirato sull'endpoint. "
                     f"Esecuzione automatica con '{MODELLO_FALLBACK}'..."
                 )
-                modello = genai.GenerativeModel(MODELLO_FALLBACK)
+                modello = genai.GenerativeModel(MODELLO_FALLBACK, generation_config=generation_config)
                 response = await modello.generate_content_async(contenuti)
             else:
                 raise mod_err
 
-        testo_risposta = (response.text or "").strip()
-        if not testo_risposta:
-            return "⚠️ Il modello Gemini non ha restituito alcun testo per questo documento."
-
-        logger.info(f"[AI VISION] Analisi completata con successo per '{path_obj.name}'.")
-        return f"📥 **Carico Magazzino Estratto:**\n\n{testo_risposta}"
+        testo_grezzo = (response.text or "").strip()
+        json_pulito = _pulisci_json_risposta(testo_grezzo)
+        logger.info(f"[AI VISION] Estrazione JSON completata per '{path_obj.name}': {json_pulito[:120]}...")
+        return json_pulito
 
     except Exception as e:
-        logger.exception(f"[AI VISION] Errore durante l'elaborazione AI: {str(e)}")
-        return f"⚠️ **Errore durante l'elaborazione AI del documento:**\n`{str(e)}`"
+        logger.exception(f"[AI VISION] Errore durante l'elaborazione AI del documento: {e}")
+        return "[]"
 
 
 def analizza_documento_carico_sync(file_path: str | Path, cfg: dict = None, api_key: str = None) -> str:

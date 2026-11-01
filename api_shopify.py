@@ -3,6 +3,7 @@
 BOT PULICHIMICA - Modulo Integrazione Shopify (api_shopify.py)
 ========================================================================================
 Racchiude tutte le chiamate REST verso Shopify:
+  - Aggiornamento giacenze da array JSON (carico magazzino con Gemini)
   - Recupero ultimi 3 ordini
   - Ricerca prodotti e giacenze sull'intero catalogo
   - Health Check API Shopify (shop.json)
@@ -12,6 +13,7 @@ Importa esclusivamente 'config' per garantire assenza totale di dipendenze circo
 """
 
 import os
+import json
 from pathlib import Path
 from datetime import datetime
 
@@ -27,6 +29,9 @@ from config import (
     logger,
     normalizza_shop_domain,
 )
+
+# ID di fallback della sede principale del negozio Pulichimica
+DEFAULT_PULICHIMICA_LOCATION_ID = 114360254847
 
 
 def _risolvi_token_shopify(cfg: dict = None) -> str:
@@ -76,6 +81,244 @@ def estrai_nome_cliente(order: dict) -> str:
     if cust.get("email"):
         return str(cust["email"]).strip()
     return "Cliente Ospite"
+
+
+def recupera_location_id_principale(shop: str, token: str, fallback_inventory_item_id: int = None) -> int:
+    """
+    Recupera il location_id principale del negozio con 4 livelli di sicurezza:
+      1. Variabile d'ambiente SHOPIFY_LOCATION_ID se esplicitata
+      2. Endpoint locations.json di Shopify (se il token ha scope read_locations)
+      3. Endpoint inventory_levels.json tramite fallback_inventory_item_id (supportato con write_inventory)
+      4. Fallback predefinito di magazzino Pulichimica (114360254847)
+    """
+    env_loc = os.getenv("SHOPIFY_LOCATION_ID", "").strip()
+    if env_loc.isdigit():
+        return int(env_loc)
+
+    headers = {
+        "X-Shopify-Access-Token": token,
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    # Tentativo via locations.json
+    try:
+        url_loc = f"https://{shop}/admin/api/{SHOPIFY_REST_VERSION}/locations.json"
+        res = requests.get(url_loc, headers=headers, timeout=8)
+        if res.status_code == 200:
+            locations = res.json().get("locations", [])
+            for loc in locations:
+                if loc.get("active") is not False and loc.get("id"):
+                    logger.info(f"[SHOPIFY LOCATION] Trovata location attiva: {loc.get('name')} (ID: {loc['id']})")
+                    return int(loc["id"])
+    except Exception as e:
+        logger.debug(f"[SHOPIFY LOCATION] Fallita lettura locations.json: {e}")
+
+    # Tentativo via inventory_levels con inventory_item_id noto
+    if fallback_inventory_item_id:
+        try:
+            url_inv = f"https://{shop}/admin/api/{SHOPIFY_REST_VERSION}/inventory_levels.json"
+            res = requests.get(url_inv, params={"inventory_item_ids": fallback_inventory_item_id}, headers=headers, timeout=8)
+            if res.status_code == 200:
+                inv_levels = res.json().get("inventory_levels", [])
+                if inv_levels and inv_levels[0].get("location_id"):
+                    loc_id = int(inv_levels[0]["location_id"])
+                    logger.info(f"[SHOPIFY LOCATION] Trovata location da inventory_levels: {loc_id}")
+                    return loc_id
+        except Exception as e:
+            logger.debug(f"[SHOPIFY LOCATION] Fallita lettura inventory_levels: {e}")
+
+    logger.info(f"[SHOPIFY LOCATION] Utilizzo location predefinita: {DEFAULT_PULICHIMICA_LOCATION_ID}")
+    return DEFAULT_PULICHIMICA_LOCATION_ID
+
+
+def _costruisci_indice_catalogo(shop: str, token: str) -> tuple[dict, list]:
+    """
+    Scarica l'elenco dei prodotti con relative varianti paginando su cursori.
+    Restituisce:
+      - mappa_sku: dizionario {sku_lower: (product_title, variant_dict)}
+      - lista_prodotti: lista di tuple (product_title_lower, product_title, variant_dict)
+    """
+    next_url = f"https://{shop}/admin/api/{SHOPIFY_REST_VERSION}/products.json?fields=id,title,variants&limit=250"
+    headers = {
+        "X-Shopify-Access-Token": token,
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    mappa_sku = {}
+    lista_prodotti = []
+    pagine_lette = 0
+
+    while next_url and pagine_lette < 10:
+        try:
+            res = requests.get(next_url, headers=headers, timeout=15)
+            if res.status_code != 200:
+                logger.error(f"[INDICE CATALOGO] Errore HTTP {res.status_code} nel caricamento catalogo.")
+                break
+
+            data = res.json()
+            products = data.get("products", [])
+            pagine_lette += 1
+
+            for p in products:
+                p_title = (p.get("title") or "").strip()
+                p_title_lower = p_title.lower()
+                variants = p.get("variants") or []
+
+                for v in variants:
+                    sku = (v.get("sku") or "").strip().lower()
+                    if sku:
+                        mappa_sku[sku] = (p_title, v)
+
+                    v_title = (v.get("title") or "").strip().lower()
+                    full_name = f"{p_title_lower} {v_title}".strip()
+                    lista_prodotti.append((p_title_lower, full_name, p_title, v))
+
+            next_url = res.links.get("next", {}).get("url")
+
+        except Exception as e:
+            logger.error(f"[INDICE CATALOGO] Eccezione caricamento catalogo: {e}")
+            break
+
+    logger.info(f"[INDICE CATALOGO] Indicizzati {len(mappa_sku)} SKU e {len(lista_prodotti)} varianti ({pagine_lette} pagine).")
+    return mappa_sku, lista_prodotti
+
+
+def aggiorna_giacenza_da_json(dati_json, cfg: dict = None) -> list[str]:
+    """
+    Riceve l'array JSON prodotto da ai_vision.py (stringa o lista Python),
+    individua ciascun articolo su Shopify tramite SKU o nome, recupera la location
+    principale ed esegue la chiamata REST di incremento giacenza (inventory_levels/adjust.json).
+    Restituisce una lista di stringhe con l'esito dettagliato per ciascuna voce.
+    """
+    # 1. Parsing sicuro dei dati in ingresso
+    if isinstance(dati_json, str):
+        try:
+            prodotti = json.loads(dati_json)
+        except Exception as e:
+            logger.error(f"[CARICO MAGAZZINO] Parsing JSON in ingresso fallito: {e}")
+            return [f"⚠️ Errore nel formato JSON restituito dall'IA: {e}"]
+    elif isinstance(dati_json, list):
+        prodotti = dati_json
+    else:
+        return ["⚠️ Formato dati non riconosciuto (attesa lista di articoli)."]
+
+    if not prodotti or not isinstance(prodotti, list):
+        return ["ℹ️ Nessun articolo utile per il carico a magazzino rilevato nel documento."]
+
+    shop = normalizza_shop_domain(cfg)
+    token = _risolvi_token_shopify(cfg)
+
+    if not shop or not token:
+        logger.error("[CARICO MAGAZZINO] Credenziali Shopify mancanti.")
+        return ["⚠️ Errore: credenziali di connessione a Shopify non configurate."]
+
+    # 2. Caricamento catalogo Shopify per risoluzione rapida SKU / Nome
+    mappa_sku, lista_prodotti = _costruisci_indice_catalogo(shop, token)
+    if not lista_prodotti:
+        return ["⚠️ Impossibile accedere al catalogo prodotti di Shopify per verificare le giacenze."]
+
+    location_id = None
+    resoconto = []
+
+    headers_adjust = {
+        "X-Shopify-Access-Token": token,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    # 3. Elaborazione e incremento di ciascun articolo
+    for item in prodotti:
+        if not isinstance(item, dict):
+            continue
+
+        sku_cercato = (item.get("sku") or "").strip()
+        nome_cercato = (item.get("nome_prodotto") or "").strip()
+        quantita_raw = item.get("quantita_aggiunta", 0)
+
+        try:
+            quantita_aggiunta = int(quantita_raw)
+        except (ValueError, TypeError):
+            quantita_aggiunta = 0
+
+        riferimento_visivo = nome_cercato or sku_cercato or "Articolo non specificato"
+
+        if quantita_aggiunta <= 0:
+            resoconto.append(f"⚠️ Quantità non valida ({quantita_raw}) per: '{riferimento_visivo}'.")
+            continue
+
+        # Ricerca variante corrispondente: priorità a SKU, poi corrispondenza nome
+        trovato_p_title = None
+        trovato_variant = None
+
+        if sku_cercato:
+            sku_key = sku_cercato.lower()
+            if sku_key in mappa_sku:
+                trovato_p_title, trovato_variant = mappa_sku[sku_key]
+            else:
+                # Ricerca per sottostringa dello SKU
+                for k, (p_t, v_d) in mappa_sku.items():
+                    if sku_key in k or k in sku_key:
+                        trovato_p_title, trovato_variant = p_t, v_d
+                        break
+
+        # Fallback ricerca per nome prodotto se non trovato per SKU
+        if not trovato_variant and nome_cercato:
+            nome_key = nome_cercato.lower()
+            # 1. Match parziale sul titolo
+            for p_title_lower, full_name, p_title, variant in lista_prodotti:
+                if nome_key in p_title_lower or p_title_lower in nome_key or nome_key in full_name:
+                    trovato_p_title = p_title
+                    trovato_variant = variant
+                    break
+
+        if not trovato_variant:
+            identificativo = f"SKU '{sku_cercato}'" if sku_cercato else f"'{nome_cercato}'"
+            resoconto.append(f"⚠️ Prodotto non trovato su Shopify: {identificativo} (qtà: +{quantita_aggiunta}).")
+            continue
+
+        inventory_item_id = trovato_variant.get("inventory_item_id")
+        if not inventory_item_id:
+            resoconto.append(f"⚠️ Articolo '{trovato_p_title}' privo di inventory_item_id su Shopify.")
+            continue
+
+        # Risoluzione dinamica di location_id al primo match
+        if location_id is None:
+            location_id = recupera_location_id_principale(shop, token, fallback_inventory_item_id=inventory_item_id)
+
+        # Chiamata REST di incremento giacenza: POST /admin/api/2024-01/inventory_levels/adjust.json
+        payload_adjust = {
+            "location_id": location_id,
+            "inventory_item_id": inventory_item_id,
+            "available_adjustment": quantita_aggiunta,
+        }
+
+        url_adjust = f"https://{shop}/admin/api/{SHOPIFY_REST_VERSION}/inventory_levels/adjust.json"
+
+        try:
+            res_adj = requests.post(url_adjust, json=payload_adjust, headers=headers_adjust, timeout=15)
+            v_title = (trovato_variant.get("title") or "").strip()
+            nome_completo = f"{trovato_p_title} ({v_title})" if v_title and v_title.lower() != "default title" else trovato_p_title
+
+            if res_adj.status_code == 200:
+                inv_data = res_adj.json().get("inventory_level", {})
+                nuova_giacenza = inv_data.get("available", "N/D")
+                logger.info(
+                    f"[CARICO MAGAZZINO] Aggiornata giacenza '{nome_completo}': +{quantita_aggiunta} "
+                    f"(Disponibile: {nuova_giacenza})."
+                )
+                resoconto.append(f"✅ Aggiunti {quantita_aggiunta} pezzi di {nome_completo} (Giacenza attuale: {nuova_giacenza} pz)")
+            else:
+                logger.error(f"[CARICO MAGAZZINO] Errore adjust per '{nome_completo}': HTTP {res_adj.status_code} - {res_adj.text}")
+                resoconto.append(f"❌ Errore aggiornamento giacenza per '{nome_completo}' (HTTP {res_adj.status_code}).")
+
+        except Exception as e:
+            logger.exception(f"[CARICO MAGAZZINO] Eccezione adjust: {e}")
+            resoconto.append(f"❌ Errore di connessione durante l'aggiornamento di '{trovato_p_title}': {str(e)}")
+
+    return resoconto
 
 
 def recupera_ultimi_tre_ordini(cfg: dict = None) -> str:
@@ -394,3 +637,227 @@ def controlla_nuovi_ordini_shopify(cfg: dict = None, notifica_fn=None) -> bool:
 def occhi_ebay(cfg: dict = None):
     """Predisposizione architetturale per futura integrazione ordini/giacenze eBay."""
     pass
+
+
+# --------------------------------------------------------------------------------------
+# 6. SOTTOSCORTA E REPORT ORDINI CON COSTO INVENTORY_ITEM
+# --------------------------------------------------------------------------------------
+def recupera_prodotti_sottoscorta(cfg: dict = None, min_qty: int = 1, max_qty: int = 5) -> list[dict]:
+    """
+    Scansiona il catalogo Shopify ed estrae i prodotti con giacenza compresa tra min_qty e max_qty (inclusi).
+    Ignora categoricamente giacenze <= 0 (out of stock o non tracciate).
+    """
+    shop = normalizza_shop_domain(cfg)
+    token = _risolvi_token_shopify(cfg)
+    if not shop or not token:
+        logger.error("[SOTTOSCORTA] Credenziali Shopify mancanti.")
+        return []
+
+    next_url = f"https://{shop}/admin/api/{SHOPIFY_REST_VERSION}/products.json?fields=id,title,variants&limit=250"
+    headers = {
+        "X-Shopify-Access-Token": token,
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    prodotti_sottoscorta = []
+    pagine_lette = 0
+
+    while next_url and pagine_lette < 10:
+        try:
+            res = requests.get(next_url, headers=headers, timeout=15)
+            if res.status_code != 200:
+                logger.error(f"[SOTTOSCORTA] Errore HTTP {res.status_code} da Shopify.")
+                break
+
+            data = res.json()
+            products = data.get("products", [])
+            pagine_lette += 1
+
+            for p in products:
+                p_title = (p.get("title") or "").strip()
+                variants = p.get("variants") or []
+                for v in variants:
+                    qty = v.get("inventory_quantity")
+                    if qty is None:
+                        continue
+                    try:
+                        qty_int = int(qty)
+                    except (ValueError, TypeError):
+                        continue
+
+                    # Filtro: giacenza compresa tra min_qty e max_qty (inclusi). Ignora <= 0!
+                    if min_qty <= qty_int <= max_qty:
+                        v_title = (v.get("title") or "").strip()
+                        nome_completo = (
+                            f"{p_title} ({v_title})"
+                            if v_title and v_title.lower() != "default title"
+                            else p_title
+                        )
+                        prodotti_sottoscorta.append({
+                            "product_id": p.get("id"),
+                            "variant_id": v.get("id"),
+                            "inventory_item_id": v.get("inventory_item_id"),
+                            "title": p_title,
+                            "variant_title": v_title,
+                            "full_name": nome_completo,
+                            "sku": (v.get("sku") or "").strip(),
+                            "inventory_quantity": qty_int,
+                        })
+
+            next_url = res.links.get("next", {}).get("url")
+
+        except Exception as e:
+            logger.error(f"[SOTTOSCORTA] Errore durante la scansione catalogo: {e}")
+            break
+
+    logger.info(f"[SOTTOSCORTA] Trovati {len(prodotti_sottoscorta)} articoli con giacenza tra {min_qty} e {max_qty} pz.")
+    return prodotti_sottoscorta
+
+
+def recupera_costi_inventory_items(inventory_item_ids: list, shop: str, token: str) -> dict:
+    """
+    Dato un elenco di inventory_item_id, interroga inventory_items.json a blocchi
+    e restituisce un dizionario {str(inventory_item_id): cost_float}.
+    Se il cost è None o assente, restituisce 0.0.
+    """
+    if not inventory_item_ids:
+        return {}
+
+    cost_map = {}
+    headers = {
+        "X-Shopify-Access-Token": token,
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    unique_ids = list({str(iid).strip() for iid in inventory_item_ids if iid})
+    chunk_size = 50
+
+    for i in range(0, len(unique_ids), chunk_size):
+        chunk = unique_ids[i : i + chunk_size]
+        ids_param = ",".join(chunk)
+        url = f"https://{shop}/admin/api/{SHOPIFY_REST_VERSION}/inventory_items.json?ids={ids_param}"
+        try:
+            res = requests.get(url, headers=headers, timeout=15)
+            if res.status_code == 200:
+                items = res.json().get("inventory_items", [])
+                for item in items:
+                    item_id = str(item.get("id"))
+                    cost_val = item.get("cost")
+                    try:
+                        cost_float = float(cost_val) if cost_val is not None else 0.0
+                    except (ValueError, TypeError):
+                        cost_float = 0.0
+                    cost_map[item_id] = cost_float
+        except Exception as e:
+            logger.error(f"[COSTI INVENTORY] Errore recupero costi per chunk: {e}")
+
+    return cost_map
+
+
+def recupera_ordini_del_giorno(data_riferimento: str = None, cfg: dict = None) -> list:
+    """
+    Recupera tutti gli ordini pagati (financial_status == 'paid') della data indicata
+    (default: oggi YYYY-MM-DD). Per ciascun articolo recupera il 'cost' dall'InventoryItem
+    (oppure 0.0 se non impostato) e calcola il totale costo d'acquisto e prezzo vendita.
+    """
+    if not data_riferimento:
+        data_riferimento = datetime.now().strftime("%Y-%m-%d")
+
+    shop = normalizza_shop_domain(cfg)
+    token = _risolvi_token_shopify(cfg)
+
+    if not shop or not token:
+        logger.error("[REPORT ORDINI] Credenziali Shopify mancanti.")
+        return []
+
+    url = f"https://{shop}/admin/api/{SHOPIFY_REST_VERSION}/orders.json"
+    headers = {
+        "X-Shopify-Access-Token": token,
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    params = {
+        "status": "any",
+        "financial_status": "paid",
+        "created_at_min": f"{data_riferimento}T00:00:00",
+        "limit": 250,
+    }
+
+    try:
+        res = requests.get(url, params=params, headers=headers, timeout=15)
+        if res.status_code != 200:
+            logger.error(f"[REPORT ORDINI] Errore HTTP {res.status_code}: {res.text}")
+            return []
+
+        all_orders = res.json().get("orders", [])
+    except Exception as e:
+        logger.error(f"[REPORT ORDINI] Eccezione recupero ordini: {e}")
+        return []
+
+    ordini_oggi = []
+    inventory_item_ids_needed = set()
+
+    # Indicizzazione catalogo per risolvere variant_id -> inventory_item_id
+    _, lista_prodotti = _costruisci_indice_catalogo(shop, token)
+    variant_to_inventory_item = {}
+    for _, _, _, var in lista_prodotti:
+        v_id = var.get("id")
+        inv_id = var.get("inventory_item_id")
+        if v_id and inv_id:
+            variant_to_inventory_item[str(v_id)] = str(inv_id)
+
+    for o in all_orders:
+        created_at = o.get("created_at", "")
+        if not created_at.startswith(data_riferimento):
+            continue
+
+        if o.get("financial_status") != "paid":
+            continue
+
+        ordini_oggi.append(o)
+        for li in o.get("line_items", []):
+            v_id = str(li.get("variant_id") or "")
+            inv_id = variant_to_inventory_item.get(v_id)
+            if inv_id:
+                inventory_item_ids_needed.add(inv_id)
+
+    cost_map = recupera_costi_inventory_items(list(inventory_item_ids_needed), shop, token)
+
+    ordini_elaborati = []
+    for o in ordini_oggi:
+        prezzo_vendita_totale = float(o.get("total_price") or 0.0)
+        costo_acquisto_totale = 0.0
+        dettagli_righe = []
+
+        for li in o.get("line_items", []):
+            qty = int(li.get("quantity") or 1)
+            v_id = str(li.get("variant_id") or "")
+            inv_id = variant_to_inventory_item.get(v_id)
+            costo_unitario = cost_map.get(inv_id, 0.0)
+            costo_linea = costo_unitario * qty
+            costo_acquisto_totale += costo_linea
+
+            dettagli_righe.append({
+                "name": li.get("name") or li.get("title") or "Articolo",
+                "sku": li.get("sku") or "",
+                "quantity": qty,
+                "price": float(li.get("price") or 0.0),
+                "unit_cost": costo_unitario,
+                "total_cost": costo_linea,
+            })
+
+        ordini_elaborati.append({
+            "id": o.get("id"),
+            "order_number": o.get("order_number") or o.get("name") or "N/D",
+            "date": data_riferimento,
+            "created_at": o.get("created_at"),
+            "customer": estrai_nome_cliente(o),
+            "total_price": round(prezzo_vendita_totale, 2),
+            "total_cost": round(costo_acquisto_totale, 2),
+            "line_items": dettagli_righe,
+        })
+
+    logger.info(f"[REPORT ORDINI] Elaborati {len(ordini_elaborati)} ordini pagati per la data {data_riferimento}.")
+    return ordini_elaborati

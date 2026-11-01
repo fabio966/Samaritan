@@ -71,6 +71,7 @@ MODULI_PROGETTO = (
     "api_shopify.py",
     "api_packlink.py",
     "ai_vision.py",
+    "task_automatici.py",
     "bot_telegram.py",
     "main.py",
 )
@@ -110,6 +111,9 @@ def load_env(env_path: Path = None) -> dict:
         "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         "PACKLINK_API_KEY": os.getenv("PACKLINK_API_KEY", "").strip(),
         "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", "").strip(),
+        "GOOGLE_SERVICE_ACCOUNT_JSON": os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "google_credentials.json").strip(),
+        "GOOGLE_SHEET_NAME": os.getenv("GOOGLE_SHEET_NAME", "Report Pulichimica").strip(),
+        "GOOGLE_SHEET_ID": os.getenv("GOOGLE_SHEET_ID", "").strip(),
     }
 
 
@@ -138,3 +142,6 @@ TELEGRAM_BOT_TOKEN = _initial_cfg["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = _initial_cfg["TELEGRAM_CHAT_ID"]
 PACKLINK_API_KEY = _initial_cfg["PACKLINK_API_KEY"]
 GEMINI_API_KEY = _initial_cfg["GEMINI_API_KEY"]
+GOOGLE_SERVICE_ACCOUNT_JSON = _initial_cfg["GOOGLE_SERVICE_ACCOUNT_JSON"]
+GOOGLE_SHEET_NAME = _initial_cfg["GOOGLE_SHEET_NAME"]
+GOOGLE_SHEET_ID = _initial_cfg["GOOGLE_SHEET_ID"]

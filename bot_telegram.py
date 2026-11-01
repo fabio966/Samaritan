@@ -38,6 +38,7 @@ from config import (
     stato_utente,
 )
 from api_shopify import (
+    aggiorna_giacenza_da_json,
     cerca_prodotti_shopify,
     check_salute_shopify,
     recupera_ultimi_tre_ordini,
@@ -272,17 +273,20 @@ def avvia_controllo_packlink_manuale(cfg: dict = None, chat_id: str = None):
 # --------------------------------------------------------------------------------------
 def processa_documento_carico_telegram(file_id: str, file_name: str, chat_id: str, cfg: dict):
     """
-    Scarica la foto o il documento PDF/immagine inviato dall'utente su Telegram,
-    lo salva in una cartella temporanea locale, lo analizza tramite ai_vision (Gemini),
-    invia il report dettagliato in chat ed elimina infine il file temporaneo.
+    Scarica la foto o il documento PDF inviato dall'utente su Telegram,
+    lo salva in una cartella temporanea locale, lo invia a ai_vision (Gemini)
+    per ottenere l'array JSON dei prodotti caricati, aggiorna le giacenze su Shopify
+    tramite api_shopify.aggiorna_giacenza_da_json(), invia il resoconto finale all'utente
+    ed elimina infine il file temporaneo.
     """
     bot_token, _ = _risolvi_credenziali_telegram(cfg)
     temp_dir = BASE_DIR / "temp_uploads"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
+    # 1. Invia messaggio iniziale di presa in carico
     _telegram_api(
         "sendMessage",
-        {"chat_id": chat_id, "text": "Sto analizzando il documento con Gemini..."},
+        {"chat_id": chat_id, "text": "Sto analizzando il documento..."},
         cfg,
     )
 
@@ -320,11 +324,20 @@ def processa_documento_carico_telegram(file_id: str, file_name: str, chat_id: st
         temp_path.write_bytes(dl_res.content)
         logger.info(f"[CARICO MAGAZZINO] Documento salvato temporaneamente in {temp_path.name} ({len(dl_res.content)} bytes).")
 
-        # c) Passa il percorso del file alla funzione di ai_vision.py
-        risultato_ai = asyncio.run(analizza_documento_carico(temp_path, cfg=cfg))
+        # b) Chiama ai_vision.py e ottiene la stringa JSON
+        json_prodotti = asyncio.run(analizza_documento_carico(temp_path, cfg=cfg))
+        logger.info(f"[CARICO MAGAZZINO] JSON estratto da Gemini: {json_prodotti[:200]}")
+
+        # c) Passa la stringa JSON a api_shopify.aggiorna_giacenza_da_json()
+        resoconto_voci = aggiorna_giacenza_da_json(json_prodotti, cfg=cfg)
 
         # d) Restituisce la risposta testuale formattata all'utente in chat
-        invia_messaggio_lungo(risultato_ai, chat_id=chat_id, cfg=cfg)
+        if resoconto_voci:
+            messaggio_finale = "📦 **Resoconto Carico Magazzino Shopify:**\n\n" + "\n".join(resoconto_voci)
+        else:
+            messaggio_finale = "ℹ️ Nessun prodotto aggiornato per questo documento."
+
+        invia_messaggio_lungo(messaggio_finale, chat_id=chat_id, cfg=cfg)
 
     except Exception as e:
         logger.exception(f"[CARICO MAGAZZINO] Errore durante l'elaborazione del documento: {e}")
