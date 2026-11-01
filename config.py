@@ -3,7 +3,8 @@
 BOT PULICHIMICA - Modulo Configurazione Centrale (config.py)
 ========================================================================================
 Gestisce il caricamento del file .env, il sistema di logging condiviso, le costanti
-operative e le variabili globali (Token Telegram, credenziali Shopify, Packlink PRO).
+operative e le variabili globali (Token Telegram, chiavi API Shopify, Packlink PRO,
+Google Gemini e Chat ID amministratore).
 Non importa alcun altro modulo del progetto per prevenire qualsiasi import circolare.
 ========================================================================================
 """
@@ -14,6 +15,7 @@ import logging
 import threading
 from pathlib import Path
 
+import dotenv
 from dotenv import load_dotenv
 
 # --------------------------------------------------------------------------------------
@@ -68,6 +70,7 @@ MODULI_PROGETTO = (
     "config.py",
     "api_shopify.py",
     "api_packlink.py",
+    "ai_vision.py",
     "bot_telegram.py",
     "main.py",
 )
@@ -106,6 +109,7 @@ def load_env(env_path: Path = None) -> dict:
         "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         "PACKLINK_API_KEY": os.getenv("PACKLINK_API_KEY", "").strip(),
+        "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY", "").strip(),
     }
 
 
@@ -133,3 +137,4 @@ SHOPIFY_API_VERSION = _initial_cfg["SHOPIFY_API_VERSION"]
 TELEGRAM_BOT_TOKEN = _initial_cfg["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = _initial_cfg["TELEGRAM_CHAT_ID"]
 PACKLINK_API_KEY = _initial_cfg["PACKLINK_API_KEY"]
+GEMINI_API_KEY = _initial_cfg["GEMINI_API_KEY"]

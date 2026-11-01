@@ -4,7 +4,8 @@ BOT PULICHIMICA - Modulo Interfaccia Telegram, OTA & Graceful Shutdown (bot_tele
 ========================================================================================
 Gestisce:
   - Invio messaggi e tastiere interattive (/menu e /admin)
-  - Handler delle callback_query e macchina a stati per la ricerca prodotti
+  - Handler delle callback_query e macchina a stati per ricerca prodotti e carico magazzino
+  - Ricezione foto e PDF per estrazione dati fatture/bolle con Google Gemini (ai_vision)
   - Listener in background 24/7 (polling getUpdates non bloccante)
   - Auto-Update modulare (GitHub Raw / Telegram file) con riavvio su 'main.py'
   - Avviso sincrono e bloccante di disconnessione (Graceful Shutdown con requests)
@@ -16,7 +17,9 @@ import sys
 import time
 import json
 import ctypes
+import asyncio
 import threading
+from pathlib import Path
 
 import requests
 
@@ -43,6 +46,7 @@ from api_packlink import (
     check_salute_packlink,
     controlla_spedizioni_packlink,
 )
+from ai_vision import analizza_documento_carico
 
 # Riferimento globale per evitare che il Garbage Collector rimuova l'handler Win32
 _WIN_CTRL_HANDLER_REF = None
@@ -120,9 +124,37 @@ def _telegram_api(metodo: str, payload: dict, cfg: dict = None, timeout: int = 1
         return False
 
 
+def invia_messaggio_lungo(testo: str, chat_id: str, cfg: dict = None):
+    """Invia messaggi spezzandoli in blocchi se superano il limite Telegram di 4096 caratteri."""
+    if not testo:
+        return
+    limite = 4000
+    if len(testo) <= limite:
+        _telegram_api("sendMessage", {"chat_id": chat_id, "text": testo}, cfg)
+    else:
+        parti = [testo[i : i + limite] for i in range(0, len(testo), limite)]
+        for p in parti:
+            _telegram_api("sendMessage", {"chat_id": chat_id, "text": p}, cfg)
+
+
 # --------------------------------------------------------------------------------------
-# 2. TASTIERE E SOTTOMENU (/menu e /admin)
+# 2. TASTIERE E SOTTOMENU (ReplyKeyboardMarkup e InlineKeyboardMarkup)
 # --------------------------------------------------------------------------------------
+REPLY_KEYBOARD_PRINCIPALE = {
+    "keyboard": [
+        [
+            {"text": "📦 Ricerca Prodotto"},
+            {"text": "📋 Ultimi 3 Ordini"},
+        ],
+        [
+            {"text": "🚚 Monitoraggio Packlink"},
+            {"text": "📥 Carico Magazzino"},
+        ],
+    ],
+    "resize_keyboard": True,
+    "one_time_keyboard": False,
+}
+
 MENU_OPERATIVO_KEYBOARD = {
     "inline_keyboard": [
         [
@@ -131,6 +163,7 @@ MENU_OPERATIVO_KEYBOARD = {
         ],
         [
             {"text": "🚚 Monitoraggio Packlink", "callback_data": "cmd_packlink"},
+            {"text": "📥 Carico Magazzino", "callback_data": "cmd_carico_magazzino"},
         ],
         [
             {"text": "🔙 Chiudi", "callback_data": "cmd_chiudi"},
@@ -151,17 +184,17 @@ MENU_ADMIN_KEYBOARD = {
 
 
 def invia_menu_operativo(cfg: dict = None, chat_id: str = None) -> bool:
-    """Invia il Menu Operativo (attivato dal comando /menu)."""
+    """Invia il Menu Operativo attivando la ReplyKeyboardMarkup principale."""
     _, default_chat_id = _risolvi_credenziali_telegram(cfg)
     target_chat = chat_id or default_chat_id
     payload = {
         "chat_id": target_chat,
-        "text": "🧭 Menu Operativo Bot Pulichimica:",
-        "reply_markup": MENU_OPERATIVO_KEYBOARD,
+        "text": "🧭 **Menu Operativo Bot Pulichimica**\nSeleziona un'operazione dai pulsanti in basso:",
+        "reply_markup": REPLY_KEYBOARD_PRINCIPALE,
     }
     ok = _telegram_api("sendMessage", payload, cfg)
     if ok:
-        logger.info("[UI TELEGRAM] Menu Operativo (/menu) inviato.")
+        logger.info("[UI TELEGRAM] Menu Operativo (ReplyKeyboardMarkup) inviato.")
     return ok
 
 
@@ -235,7 +268,83 @@ def avvia_controllo_packlink_manuale(cfg: dict = None, chat_id: str = None):
 
 
 # --------------------------------------------------------------------------------------
-# 4. AUTO-UPDATE MODULARE & RIAVVIO SU 'main.py'
+# 4. GESTIONE DOCUMENTI CARICO MAGAZZINO (DOWNLOAD & ELABORAZIONE CON GEMINI)
+# --------------------------------------------------------------------------------------
+def processa_documento_carico_telegram(file_id: str, file_name: str, chat_id: str, cfg: dict):
+    """
+    Scarica la foto o il documento PDF/immagine inviato dall'utente su Telegram,
+    lo salva in una cartella temporanea locale, lo analizza tramite ai_vision (Gemini),
+    invia il report dettagliato in chat ed elimina infine il file temporaneo.
+    """
+    bot_token, _ = _risolvi_credenziali_telegram(cfg)
+    temp_dir = BASE_DIR / "temp_uploads"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    _telegram_api(
+        "sendMessage",
+        {"chat_id": chat_id, "text": "Sto analizzando il documento con Gemini..."},
+        cfg,
+    )
+
+    temp_path = None
+    try:
+        # a) Scarica e salva in cartella temporanea
+        info_res = requests.get(
+            f"https://api.telegram.org/bot{bot_token}/getFile",
+            params={"file_id": file_id},
+            timeout=15,
+        )
+        if info_res.status_code != 200 or not info_res.json().get("ok"):
+            _telegram_api(
+                "sendMessage",
+                {"chat_id": chat_id, "text": "⚠️ Impossibile recuperare i metadati del file da Telegram."},
+                cfg,
+            )
+            return
+
+        file_path_remoto = info_res.json()["result"]["file_path"]
+        ext = Path(file_path_remoto).suffix or Path(file_name).suffix or ".jpg"
+        temp_path = temp_dir / f"carico_{int(time.time())}_{file_id[:8]}{ext}"
+
+        # Download effettivo del file
+        dl_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path_remoto}"
+        dl_res = requests.get(dl_url, timeout=35)
+        if dl_res.status_code != 200 or not dl_res.content:
+            _telegram_api(
+                "sendMessage",
+                {"chat_id": chat_id, "text": "⚠️ Errore durante il download del documento dai server Telegram."},
+                cfg,
+            )
+            return
+
+        temp_path.write_bytes(dl_res.content)
+        logger.info(f"[CARICO MAGAZZINO] Documento salvato temporaneamente in {temp_path.name} ({len(dl_res.content)} bytes).")
+
+        # c) Passa il percorso del file alla funzione di ai_vision.py
+        risultato_ai = asyncio.run(analizza_documento_carico(temp_path, cfg=cfg))
+
+        # d) Restituisce la risposta testuale formattata all'utente in chat
+        invia_messaggio_lungo(risultato_ai, chat_id=chat_id, cfg=cfg)
+
+    except Exception as e:
+        logger.exception(f"[CARICO MAGAZZINO] Errore durante l'elaborazione del documento: {e}")
+        _telegram_api(
+            "sendMessage",
+            {"chat_id": chat_id, "text": f"⚠️ Si è verificato un errore durante l'elaborazione del file:\n`{e}`"},
+            cfg,
+        )
+    finally:
+        # e) Elimina il file temporaneo per non intasare il NAS
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink(missing_ok=True)
+                logger.info(f"[CARICO MAGAZZINO] File temporaneo {temp_path.name} eliminato con successo.")
+            except Exception as e:
+                logger.warning(f"[CARICO MAGAZZINO] Impossibile eliminare {temp_path.name}: {e}")
+
+
+# --------------------------------------------------------------------------------------
+# 5. AUTO-UPDATE MODULARE & RIAVVIO SU 'main.py'
 # --------------------------------------------------------------------------------------
 def applica_aggiornamenti_e_riavvia(modifiche: dict, cfg: dict = None, sorgente: str = "OTA"):
     """
@@ -302,8 +411,7 @@ def applica_aggiornamenti_e_riavvia(modifiche: dict, cfg: dict = None, sorgente:
 def cerca_aggiornamenti(cfg: dict = None) -> bool:
     """
     Controllo aggiornamenti (notturno alle ore 03:00 o forzato da /admin) su tutti
-    i moduli dell'architettura (config.py, api_shopify.py, api_packlink.py,
-    bot_telegram.py, main.py). Se rileva modifiche su GitHub, aggiorna e riavvia main.py.
+    i moduli dell'architettura. Se rileva modifiche su GitHub, aggiorna e riavvia main.py.
     """
     logger.info(f"[OTA GITHUB] Verifica aggiornamenti modulari su: {GITHUB_RAW_BASE_URL}")
     modifiche_rilevate = {}
@@ -343,7 +451,7 @@ def cerca_aggiornamenti(cfg: dict = None) -> bool:
 
 
 # --------------------------------------------------------------------------------------
-# 5. CALLBACK HANDLER & LISTENER TELEGRAM 24/7
+# 6. CALLBACK HANDLER & LISTENER TELEGRAM 24/7
 # --------------------------------------------------------------------------------------
 def gestisci_callback_query(callback_query: dict, cfg: dict, authorized_chat_id: str):
     """Gestisce tutte le callback_query dei sottomenu /menu e /admin."""
@@ -401,6 +509,22 @@ def gestisci_callback_query(callback_query: dict, cfg: dict, authorized_chat_id:
         stato_utente[chat_id] = None
         avvia_controllo_packlink_manuale(cfg=cfg, chat_id=chat_id)
 
+    elif data == "cmd_carico_magazzino":
+        stato_utente[chat_id] = "attesa_carico"
+        logger.info(f"[STATO CHAT] stato_utente['{chat_id}'] impostato su 'attesa_carico'.")
+        _telegram_api(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": (
+                    "📥 **Carico Magazzino con AI (Google Gemini)**\n\n"
+                    "Invia una **foto** o un **file PDF** della bolla di consegna (DDT) o fattura da caricare.\n\n"
+                    "_(Per annullare in qualsiasi momento digita /menu o /annulla)_"
+                ),
+            },
+            cfg,
+        )
+
     elif data == "cmd_chiudi":
         stato_utente[chat_id] = None
         if message_id is not None:
@@ -422,8 +546,11 @@ def gestisci_callback_query(callback_query: dict, cfg: dict, authorized_chat_id:
 
 def orecchie_telegram_worker(cfg: dict, stop_event: threading.Event):
     """
-    Thread daemon attivo 24 ore su 24 per gestire comandi (/menu, /start, /admin),
-    ricerca prodotti tramite stato_utente, pulsanti inline e aggiornamenti OTA via file.
+    Thread daemon attivo 24 ore su 24 per gestire:
+      - comandi (/menu, /start, /admin, /annulla)
+      - ricerca prodotti testuale (stato 'attesa_ricerca')
+      - ricezione foto e PDF per carico magazzino AI (stato 'attesa_carico')
+      - pulsanti inline e aggiornamenti OTA via file
     """
     bot_token, authorized_chat_id = _risolvi_credenziali_telegram(cfg)
 
@@ -474,6 +601,7 @@ def orecchie_telegram_worker(cfg: dict, stop_event: threading.Event):
             for update in data.get("result", []):
                 offset = update["update_id"] + 1
 
+                # 1. Gestione click pulsanti Inline Keyboard
                 callback_query = update.get("callback_query")
                 if callback_query:
                     try:
@@ -493,11 +621,44 @@ def orecchie_telegram_worker(cfg: dict, stop_event: threading.Event):
                     logger.warning(f"[ORECCHIE TELEGRAM] Interazione ignorata da ID non autorizzato '{sender_id or chat_id}'.")
                     continue
 
+                in_attesa_carico = (stato_utente.get(chat_id) == "attesa_carico")
+
+                # 2. Gestione Foto inviata dall'utente
+                photo_list = msg.get("photo")
+                if photo_list:
+                    if in_attesa_carico:
+                        stato_utente[chat_id] = None
+                        best_photo = photo_list[-1]
+                        file_id = best_photo.get("file_id")
+                        logger.info(f"[ORECCHIE TELEGRAM] Ricevuta foto per carico magazzino (file_id={file_id}).")
+                        processa_documento_carico_telegram(file_id, "bolla.jpg", chat_id, cfg)
+                        continue
+                    else:
+                        logger.info("[ORECCHIE TELEGRAM] Foto ricevuta fuori dal flusso di carico magazzino.")
+                        _telegram_api(
+                            "sendMessage",
+                            {
+                                "chat_id": chat_id,
+                                "text": "ℹ️ Foto ricevuta. Per avviare l'analisi del carico merci premi prima il tasto **📥 Carico Magazzino** nel /menu.",
+                            },
+                            cfg,
+                        )
+                        continue
+
+                # 3. Gestione Documento (PDF, Immagine come file o Modulo OTA)
                 doc = msg.get("document")
                 if doc:
                     file_name = doc.get("file_name", "")
+                    file_id = doc.get("file_id")
+
+                    if in_attesa_carico:
+                        stato_utente[chat_id] = None
+                        logger.info(f"[ORECCHIE TELEGRAM] Ricevuto documento '{file_name}' per carico magazzino.")
+                        processa_documento_carico_telegram(file_id, file_name, chat_id, cfg)
+                        continue
+
+                    # Se non è in attesa carico ed è un file di codice del progetto, gestisce OTA
                     if file_name in MODULI_PROGETTO:
-                        file_id = doc.get("file_id")
                         logger.info(f"[ORECCHIE TELEGRAM] Ricevuto modulo OTA '{file_name}' via Telegram (file_id={file_id}).")
                         info_res = requests.get(
                             f"https://api.telegram.org/bot{bot_token}/getFile",
@@ -518,12 +679,29 @@ def orecchie_telegram_worker(cfg: dict, stop_event: threading.Event):
                                 )
                                 return
                         bocca_telegram("ERRORE: Impossibile scaricare il file di aggiornamento da Telegram.", cfg=cfg)
-                elif msg.get("text"):
+                        continue
+
+                    # Documento generico ricevuto senza essere in attesa carico
+                    _telegram_api(
+                        "sendMessage",
+                        {
+                            "chat_id": chat_id,
+                            "text": f"ℹ️ Ricevuto '{file_name}'. Per analizzarlo con Gemini come carico magazzino, premi prima **📥 Carico Magazzino** dal /menu.",
+                        },
+                        cfg,
+                    )
+                    continue
+
+                # 4. Gestione Messaggi Testuali e Comandi
+                if msg.get("text"):
                     testo = msg.get("text").strip()
                     logger.info(f"[ORECCHIE TELEGRAM] Messaggio ricevuto: \"{testo}\"")
                     comando = testo.lower().split("@")[0]
 
-                    if comando in ["/menu", "/start"]:
+                    if comando in ["/annulla", "annulla", "/cancel"]:
+                        stato_utente[chat_id] = None
+                        _telegram_api("sendMessage", {"chat_id": chat_id, "text": "✅ Operazione annullata."}, cfg)
+                    elif comando in ["/menu", "/start"]:
                         stato_utente[chat_id] = None
                         invia_menu_operativo(cfg, chat_id=chat_id)
                     elif comando == "/admin":
@@ -532,12 +710,56 @@ def orecchie_telegram_worker(cfg: dict, stop_event: threading.Event):
                     elif testo == "🚚 Monitoraggio Packlink" or comando == "/packlink":
                         stato_utente[chat_id] = None
                         avvia_controllo_packlink_manuale(cfg=cfg, chat_id=chat_id)
+                    elif testo == "📥 Carico Magazzino" or comando == "/carico":
+                        stato_utente[chat_id] = "attesa_carico"
+                        _telegram_api(
+                            "sendMessage",
+                            {
+                                "chat_id": chat_id,
+                                "text": (
+                                    "📥 **Carico Magazzino con AI (Google Gemini)**\n\n"
+                                    "Invia ora una **foto** o un file **PDF** della bolla/fattura (oppure digita /annulla)."
+                                ),
+                            },
+                            cfg,
+                        )
+                    elif testo == "📦 Ricerca Prodotto":
+                        stato_utente[chat_id] = "attesa_ricerca"
+                        _telegram_api(
+                            "sendMessage",
+                            {
+                                "chat_id": chat_id,
+                                "text": "🔍 Scrivi il nome del prodotto (o una parte di esso) da cercare:",
+                            },
+                            cfg,
+                        )
+                    elif testo == "📋 Ultimi 3 Ordini":
+                        stato_utente[chat_id] = None
+                        _telegram_api(
+                            "sendMessage",
+                            {"chat_id": chat_id, "text": "⏳ Recupero ultimi 3 ordini da Shopify..."},
+                            cfg,
+                        )
+                        report_ordini = recupera_ultimi_tre_ordini(cfg)
+                        invia_messaggio_lungo(report_ordini, chat_id=chat_id, cfg=cfg)
                     elif stato_utente.get(chat_id) == "attesa_ricerca":
                         stato_utente[chat_id] = None
                         query_ricerca = testo
                         logger.info(f"[RICERCA PRODOTTO] Esecuzione ricerca per query: '{query_ricerca}'")
                         messaggio_risultati = cerca_prodotti_shopify(query_ricerca, cfg)
                         _telegram_api("sendMessage", {"chat_id": chat_id, "text": messaggio_risultati}, cfg)
+                    elif in_attesa_carico:
+                        _telegram_api(
+                            "sendMessage",
+                            {
+                                "chat_id": chat_id,
+                                "text": (
+                                    "ℹ️ Sono in attesa di un'**immagine** o di un file **PDF** della bolla o fattura.\n"
+                                    "Allega il file in chat oppure digita /annulla per uscire."
+                                ),
+                            },
+                            cfg,
+                        )
 
         except requests.exceptions.RequestException:
             time.sleep(3)
@@ -559,7 +781,7 @@ def avvia_thread_orecchie(cfg: dict, stop_event: threading.Event) -> threading.T
 
 
 # --------------------------------------------------------------------------------------
-# 6. GRACEFUL SHUTDOWN SINCRONO E BLOCCANTE (REQUESTS POST DIRETTA)
+# 7. GRACEFUL SHUTDOWN SINCRONO E BLOCCANTE (REQUESTS POST DIRETTA)
 # --------------------------------------------------------------------------------------
 def invia_spegnimento_sincrono(cfg: dict = None, timeout: int = 5):
     """
