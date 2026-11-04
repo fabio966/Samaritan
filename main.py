@@ -13,6 +13,7 @@ Coordina tutti i moduli dell'architettura:
 ========================================================================================
 """
 
+import os
 import sys
 import time
 import signal
@@ -171,6 +172,22 @@ async def main():
                 if now.hour == 3 and last_nightly_ota_date != today_str:
                     last_nightly_ota_date = today_str
                     cerca_aggiornamenti(cfg)
+
+                # --- GESTIONE COMANDI DA GUI (FLAG FILES) ---
+                if os.path.exists("update.flag"):
+                    os.remove("update.flag")
+                    logger.info("[GUI FLAG] Avvio aggiornamento OTA richiesto da Dashboard...")
+                    cerca_aggiornamenti(cfg=cfg, chat_id=chat_id_target)
+
+                if os.path.exists("stock.flag"):
+                    os.remove("stock.flag")
+                    logger.info("[GUI FLAG] Avvio check sottoscorta richiesto da Dashboard...")
+                    await controllo_sottoscorta(bot=None, chat_id=chat_id_target)
+
+                if os.path.exists("report.flag"):
+                    os.remove("report.flag")
+                    logger.info("[GUI FLAG] Avvio invio Report Drive richiesto da Dashboard...")
+                    await aggiorna_report_drive(chat_id=chat_id_target)
 
                 await asyncio.sleep(MAIN_LOOP_TICK_SECONDS)
 
